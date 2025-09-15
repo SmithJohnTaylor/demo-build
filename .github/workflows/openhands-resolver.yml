@@ -1,4 +1,5 @@
 name: Resolve Issue with OpenHands
+
 on:
   issues:
     types: [labeled]
@@ -18,8 +19,13 @@ permissions:
 
 jobs:
   resolve:
-    runs-on: ubuntu-latest
-    if: contains(github.event.comment.body, '@openhands-agent') || ${{ vars.OPENHANDS_MACRO }}
+    runs-on: ${{ vars.TARGET_RUNNER || 'ubuntu-latest' }}
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, vars.OPENHANDS_MACRO || '@openhands-agent')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, vars.OPENHANDS_MACRO || '@openhands-agent')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, vars.OPENHANDS_MACRO || '@openhands-agent')) ||
+      (github.event_name == 'issues' && github.event.action == 'labeled') ||
+      (github.event_name == 'pull_request' && github.event.action == 'labeled')
     
     steps:
       - name: Checkout
@@ -27,23 +33,45 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          ref: ${{ vars.TARGET_BRANCH || 'main' }}
           
       - name: Setup Git and fix permissions
         run: |
           git config --global user.email "action@github.com"
           git config --global user.name "GitHub Action"
-          sudo chown -R $(whoami):$(whoami) .
-          sudo chmod -R 777 .git
-          sudo rm -f .git/index.lock
+          git config --global init.defaultBranch ${{ vars.TARGET_BRANCH || 'main' }}
           
-      - name: Run OpenHands
+          # Fix ownership and permissions
+          sudo chown -R $(whoami):$(whoami) .
+          sudo chmod -R 755 .
+          sudo chmod -R 777 .git
+          sudo rm -f .git/index.lock .git/refs/heads/*.lock 2>/dev/null || true
+          
+      - name: Get issue/PR number
+        id: get_number
+        run: |
+          if [ "${{ github.event_name }}" = "issues" ] || [ "${{ github.event_name }}" = "issue_comment" ]; then
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "pull_request" ] || [ "${{ github.event_name }}" = "pull_request_review_comment" ] || [ "${{ github.event_name }}" = "pull_request_review" ]; then
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Run OpenHands Resolver
         env:
+          # Use the same secret names as your original workflow
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
-          LLM_MODEL: ${{ vars.LLM_MODEL || 'meta-llama/Llama-Vision-Free' }}
-          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          LLM_MODEL: ${{ vars.LLM_MODEL || 'anthropic/claude-sonnet-4-20250514' }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
           PAT_USERNAME: ${{ secrets.PAT_USERNAME }}
+          MAX_ITERATIONS: ${{ vars.OPENHANDS_MAX_ITER || '50' }}
         run: |
+          # Use custom base container if specified
+          BASE_IMAGE="${{ vars.OPENHANDS_BASE_CONTAINER_IMAGE }}"
+          if [ -z "$BASE_IMAGE" ]; then
+            BASE_IMAGE="ghcr.io/all-hands-ai/openhands:latest"
+          fi
+          
           docker run --rm \
             --user root \
             -v $GITHUB_WORKSPACE:/workspace \
@@ -52,8 +80,36 @@ jobs:
             -e LLM_API_KEY \
             -e LLM_BASE_URL \
             -e LLM_MODEL \
-            -e PAT_TOKEN \
-            ghcr.io/all-hands-ai/openhands:latest \
-            python -m openhands.resolver.resolve_issue \
-              --repo-path /workspace \
-              --issue-number ${{ github.event.issue.number || github.event.pull_request.number }}
+            -e GITHUB_TOKEN \
+            -e PAT_USERNAME \
+            -e MAX_ITERATIONS \
+            "$BASE_IMAGE" \
+            bash -c "
+              # Fix permissions inside container
+              chown -R openhands:openhands /workspace 2>/dev/null || true
+              chmod -R 755 /workspace 2>/dev/null || true
+              chmod -R 777 /workspace/.git 2>/dev/null || true
+              rm -f /workspace/.git/index.lock 2>/dev/null || true
+              
+              # Run the resolver with max iterations
+              python -m openhands.resolver.resolve_issue \
+                --repo-path /workspace \
+                --issue-number ${{ steps.get_number.outputs.number }} \
+                --max-iterations \$MAX_ITERATIONS
+            "
+            
+      - name: Final permission fix and commit
+        if: always()
+        run: |
+          sudo chown -R $(whoami):$(whoami) .
+          sudo chmod -R 755 .git
+          sudo rm -f .git/index.lock
+          
+          # Check if there are changes to commit
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            git add .
+            git commit -m "OpenHands: Resolve issue #${{ steps.get_number.outputs.number }}" || true
+            git push origin ${{ vars.TARGET_BRANCH || 'main' }} || true
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
