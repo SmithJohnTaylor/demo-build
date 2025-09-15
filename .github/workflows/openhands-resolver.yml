@@ -1,5 +1,4 @@
 name: Resolve Issue with OpenHands
-
 on:
   issues:
     types: [labeled]
@@ -18,17 +17,42 @@ permissions:
   issues: write
 
 jobs:
-  call-openhands-resolver:
-    uses: All-Hands-AI/OpenHands/.github/workflows/openhands-resolver.yml@main
-    with:
-      macro: ${{ vars.OPENHANDS_MACRO || '@openhands-agent' }}
-      max_iterations: ${{ fromJson(vars.OPENHANDS_MAX_ITER || 50) }}
-      base_container_image: ${{ vars.OPENHANDS_BASE_CONTAINER_IMAGE || '' }}
-      LLM_MODEL: ${{ vars.LLM_MODEL || 'anthropic/claude-sonnet-4-20250514' }}
-      target_branch: ${{ vars.TARGET_BRANCH || 'main' }}
-      runner: ${{ vars.TARGET_RUNNER }}
-    secrets:
-      PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
-      PAT_USERNAME: ${{ secrets.PAT_USERNAME }}
-      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-      LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+  resolve:
+    runs-on: ubuntu-latest
+    if: contains(github.event.comment.body, '@openhands-agent') || github.event.label.name == 'openhands'
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          
+      - name: Setup Git and fix permissions
+        run: |
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          sudo chown -R $(whoami):$(whoami) .
+          sudo chmod -R 777 .git
+          sudo rm -f .git/index.lock
+          
+      - name: Run OpenHands
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL || 'meta-llama/Llama-Vision-Free' }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          docker run --rm \
+            --user root \
+            -v $GITHUB_WORKSPACE:/workspace \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -w /workspace \
+            -e OPENAI_API_KEY \
+            -e OPENAI_BASE_URL \
+            -e LLM_MODEL \
+            -e GITHUB_TOKEN \
+            ghcr.io/all-hands-ai/openhands:latest \
+            python -m openhands.resolver.resolve_issue \
+              --repo-path /workspace \
+              --issue-number ${{ github.event.issue.number || github.event.pull_request.number }}
